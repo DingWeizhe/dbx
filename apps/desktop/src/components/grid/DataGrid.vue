@@ -14,6 +14,7 @@ import {
   ArrowDown,
   ArrowUpDown,
   ArrowUpRight,
+  IdCard,
   ExternalLink,
   Download,
   Upload,
@@ -318,6 +319,8 @@ import {
   type DataGridColumnSortState,
 } from "@/lib/dataGrid/dataGridContextMenu";
 import { clearAllColumnHighlights, clearColumnHighlight, computeColumnHighlightMatchKeys, hasColumnHighlight, isColumnDuplicateHighlightActive, isColumnNullHighlightActive, setColumnDuplicateHighlight, setColumnNullHighlight, type ColumnHighlightRule } from "@/lib/dataGrid/dataGridColumnHighlight";
+import DataGridForeignKeyCard, { type ForeignKeyCardAnchor } from "@/components/grid/DataGridForeignKeyCard.vue";
+import { defaultForeignKeyCardHtml, foreignKeyCardTemplateKey, renderForeignKeyCardHtml } from "@/lib/dataGrid/foreignKeyCard";
 import { buildColumnForeignKeyMap, combineForeignKeyConditions, foreignKeyAssociationCells, foreignKeyNavigationTarget, foreignKeySourceColumnName, type ForeignKeyAssociation } from "@/lib/dataGrid/dataGridForeignKeyNavigation";
 import {
   collectForeignKeyDisplayValues,
@@ -431,6 +434,7 @@ const DataGridValueDiffDialog = defineAsyncComponent(() => import("@/components/
 const DataGridMongoJsonPreview = defineAsyncComponent(() => import("@/components/grid/DataGridMongoJsonPreview.vue"));
 const DataGridDetailDialogs = defineAsyncComponent(() => import("@/components/grid/DataGridDetailDialogs.vue"));
 const DataGridBulkEditDialog = defineAsyncComponent(() => import("@/components/grid/DataGridBulkEditDialog.vue"));
+const DataGridForeignKeyCardEditorDialog = defineAsyncComponent(() => import("@/components/grid/DataGridForeignKeyCardEditorDialog.vue"));
 const DataGridCopyColumnNamesDialog = defineAsyncComponent(() => import("@/components/grid/DataGridCopyColumnNamesDialog.vue"));
 const DataGridInsertRowsDialog = defineAsyncComponent(() => import("@/components/grid/DataGridInsertRowsDialog.vue"));
 const ExportProgressDialog = defineAsyncComponent(() => import("@/components/export/ExportProgressDialog.vue"));
@@ -13025,10 +13029,11 @@ watch(
   { immediate: true },
 );
 
-async function navigateToForeignKeyCell(rowIndex: number, actualColIdx: number) {
+/** 外键单元格 → 被引用表上的 WHERE 条件（跳转与资讯卡共用）。不可解析时返回 undefined，出错时抛出。 */
+async function foreignKeyCellCondition(rowIndex: number, actualColIdx: number): Promise<{ association: ForeignKeyAssociation; condition: string } | undefined> {
   const association = cellForeignKeyAssociation(actualColIdx);
   const item = displayItems.value[rowIndex];
-  if (!association || !item || !props.connectionId) return;
+  if (!association || !item || !props.connectionId) return undefined;
   let cells = foreignKeyAssociationCells({
     association,
     context: props.context,
@@ -13036,30 +13041,37 @@ async function navigateToForeignKeyCell(rowIndex: number, actualColIdx: number) 
     sourceColumns: props.sourceColumns,
     row: item.data,
   });
-  if (!cells) return;
+  if (!cells) return undefined;
+  const resolved = await resolveLargeValueCells(
+    [item.id],
+    cells.map((cell) => cell.columnIndex),
+  );
+  const resolvedRow = resolved.get(item.id);
+  if (resolvedRow) {
+    cells = cells.map((cell) => (resolvedRow.has(cell.columnIndex) ? { ...cell, value: resolvedRow.get(cell.columnIndex) ?? null } : cell));
+    if (cells.some((cell) => cell.value === null)) throw new Error(t("grid.largeValueRowUnavailable"));
+  }
+  const conditions = await Promise.all(
+    cells.map(({ foreignKey, value }) =>
+      buildColumnValueFilterCondition({
+        databaseType: resolvedDatabaseType.value,
+        identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
+        columnName: foreignKey.ref_column,
+        columnInfo: props.tableMeta?.columns.find((column) => column.name.toLowerCase() === foreignKey.column.toLowerCase()),
+        rawValue: String(value),
+      }),
+    ),
+  );
+  const condition = combineForeignKeyConditions(conditions);
+  return condition ? { association, condition } : undefined;
+}
+
+async function navigateToForeignKeyCell(rowIndex: number, actualColIdx: number) {
+  if (!props.connectionId) return;
   try {
-    const resolved = await resolveLargeValueCells(
-      [item.id],
-      cells.map((cell) => cell.columnIndex),
-    );
-    const resolvedRow = resolved.get(item.id);
-    if (resolvedRow) {
-      cells = cells.map((cell) => (resolvedRow.has(cell.columnIndex) ? { ...cell, value: resolvedRow.get(cell.columnIndex) ?? null } : cell));
-      if (cells.some((cell) => cell.value === null)) throw new Error(t("grid.largeValueRowUnavailable"));
-    }
-    const conditions = await Promise.all(
-      cells.map(({ foreignKey, value }) =>
-        buildColumnValueFilterCondition({
-          databaseType: resolvedDatabaseType.value,
-          identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
-          columnName: foreignKey.ref_column,
-          columnInfo: props.tableMeta?.columns.find((column) => column.name.toLowerCase() === foreignKey.column.toLowerCase()),
-          rawValue: String(value),
-        }),
-      ),
-    );
-    const condition = combineForeignKeyConditions(conditions);
-    if (!condition) return;
+    const target = await foreignKeyCellCondition(rowIndex, actualColIdx);
+    if (!target) return;
+    const { association, condition } = target;
     await openTableTarget(
       foreignKeyNavigationTarget({
         connectionId: props.connectionId,
@@ -13073,6 +13085,211 @@ async function navigateToForeignKeyCell(rowIndex: number, actualColIdx: number) 
     toast(String(e?.message || e), 5000);
   }
 }
+
+// ---- 外键资讯卡 ----
+interface ForeignKeyCardState {
+  rowIndex: number;
+  col: number;
+  anchor: ForeignKeyCardAnchor;
+  table: string;
+  templateKey: string;
+  loading: boolean;
+  error?: string;
+  columns: ColumnInfo[];
+  record?: Record<string, CellValue>;
+  /** 点击打开的卡片不随悬停离开而关闭。 */
+  pinned: boolean;
+}
+
+interface ForeignKeyCardEditorState {
+  table: string;
+  templateKey: string;
+  columns: ColumnInfo[];
+  record?: Record<string, CellValue>;
+}
+
+const foreignKeyCard = ref<ForeignKeyCardState | null>(null);
+const foreignKeyCardEditor = ref<ForeignKeyCardEditorState | null>(null);
+const foreignKeyCardEditorOpen = ref(false);
+const foreignKeyCardButtonRef = ref<HTMLButtonElement | null>(null);
+const foreignKeyCardColumnsCache = new Map<string, Promise<ColumnInfo[]>>();
+const foreignKeyCardHoverMode = computed(() => settingsStore.editorSettings.foreignKeyCardTrigger === "hover");
+let foreignKeyCardRequestId = 0;
+let foreignKeyCardHoverTimer: ReturnType<typeof setTimeout> | undefined;
+let foreignKeyCardCloseTimer: ReturnType<typeof setTimeout> | undefined;
+let foreignKeyCardPointerInside = false;
+
+const foreignKeyCardHtml = computed(() => {
+  const card = foreignKeyCard.value;
+  if (!card?.record) return "";
+  const saved = settingsStore.editorSettings.foreignKeyCardTemplates[card.templateKey]?.html;
+  return renderForeignKeyCardHtml(saved ?? defaultForeignKeyCardHtml(card.columns.map((column) => column.name)), card.record);
+});
+
+function foreignKeyCardAnchorFromElement(element: Element): ForeignKeyCardAnchor {
+  const rect = element.getBoundingClientRect();
+  return { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+}
+
+function foreignKeyCardOpenFor(rowIndex: number, actualColIdx: number): boolean {
+  return foreignKeyCard.value?.rowIndex === rowIndex && foreignKeyCard.value.col === actualColIdx;
+}
+
+function foreignKeyCardColumns(schema: string, table: string): Promise<ColumnInfo[]> {
+  const key = JSON.stringify([props.connectionId, props.database || "", props.tableMeta?.catalog || "", schema, table]);
+  let columns = foreignKeyCardColumnsCache.get(key);
+  if (!columns) {
+    columns = api.getColumns(props.connectionId!, props.database || "", schema, table, props.tableMeta?.catalog);
+    foreignKeyCardColumnsCache.set(key, columns);
+    columns.catch(() => foreignKeyCardColumnsCache.delete(key));
+  }
+  return columns;
+}
+
+async function openForeignKeyCard(rowIndex: number, actualColIdx: number, anchor: ForeignKeyCardAnchor, pinned: boolean) {
+  const association = cellForeignKeyAssociation(actualColIdx);
+  if (!association || !props.connectionId) return;
+  clearTimeout(foreignKeyCardCloseTimer);
+  const fk = association.foreignKey;
+  const schema = fk.ref_schema || props.tableMeta?.schema || props.schema || (isSchemaAware(resolvedDatabaseType.value) ? "" : props.database) || "";
+  const requestId = ++foreignKeyCardRequestId;
+  foreignKeyCard.value = {
+    rowIndex,
+    col: actualColIdx,
+    anchor,
+    table: fk.ref_table,
+    templateKey: foreignKeyCardTemplateKey({ connectionId: props.connectionId, database: props.database, catalog: props.tableMeta?.catalog, schema, table: fk.ref_table }),
+    loading: true,
+    columns: [],
+    pinned,
+  };
+  try {
+    const target = await foreignKeyCellCondition(rowIndex, actualColIdx);
+    const columns = await foreignKeyCardColumns(schema, fk.ref_table);
+    let record: Record<string, CellValue> | undefined;
+    if (target) {
+      // 取整行：自定义模板可引用任意列，编辑器预览也需要完整记录。
+      const sql = await buildTableSelectSql({
+        databaseType: resolvedDatabaseType.value,
+        driverProfile: connectionStore.getConfig(props.connectionId)?.driver_profile,
+        serverVersion: connectionStore.getConfig(props.connectionId)?.database_info?.productVersion,
+        identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
+        catalog: props.tableMeta?.catalog,
+        database: props.database,
+        schema,
+        tableName: fk.ref_table,
+        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+        whereInput: target.condition,
+        limit: 1,
+      });
+      const result = await api.executeQuery(props.connectionId, props.executionDatabase ?? props.database ?? "", sql, schema, undefined, { maxRows: 1, fetchSize: 1, pageSize: 1 });
+      const row = result.rows[0];
+      if (row) record = Object.fromEntries(result.columns.map((column, index) => [column, (row[index] ?? null) as CellValue]));
+    }
+    if (requestId !== foreignKeyCardRequestId || !foreignKeyCard.value) return;
+    foreignKeyCard.value = { ...foreignKeyCard.value, loading: false, columns, record };
+  } catch (e: any) {
+    if (requestId !== foreignKeyCardRequestId || !foreignKeyCard.value) return;
+    foreignKeyCard.value = { ...foreignKeyCard.value, loading: false, error: String(e?.message || e) };
+  }
+}
+
+function closeForeignKeyCard() {
+  clearTimeout(foreignKeyCardHoverTimer);
+  clearTimeout(foreignKeyCardCloseTimer);
+  foreignKeyCardRequestId += 1;
+  foreignKeyCardPointerInside = false;
+  foreignKeyCard.value = null;
+}
+
+function scheduleForeignKeyCardClose() {
+  if (!foreignKeyCardHoverMode.value || !foreignKeyCard.value || foreignKeyCard.value.pinned) return;
+  clearTimeout(foreignKeyCardCloseTimer);
+  foreignKeyCardCloseTimer = setTimeout(() => {
+    if (!foreignKeyCardPointerInside && !foreignKeyCard.value?.pinned) closeForeignKeyCard();
+  }, 200);
+}
+
+function toggleForeignKeyCard(rowIndex: number, actualColIdx: number, event: MouseEvent) {
+  const card = foreignKeyCard.value;
+  if (card && foreignKeyCardOpenFor(rowIndex, actualColIdx)) {
+    // 悬停模式下点击按钮把卡片固定住；再点一次才关闭。
+    if (!card.pinned) foreignKeyCard.value = { ...card, pinned: true };
+    else closeForeignKeyCard();
+    return;
+  }
+  void openForeignKeyCard(rowIndex, actualColIdx, foreignKeyCardAnchorFromElement(event.currentTarget as Element), true);
+}
+
+function onForeignKeyCardPointerEnter() {
+  foreignKeyCardPointerInside = true;
+  clearTimeout(foreignKeyCardCloseTimer);
+}
+
+function onForeignKeyCardPointerLeave() {
+  foreignKeyCardPointerInside = false;
+  scheduleForeignKeyCardClose();
+}
+
+function editForeignKeyCardTemplate() {
+  const card = foreignKeyCard.value;
+  if (!card || card.loading) return;
+  foreignKeyCardEditor.value = { table: card.table, templateKey: card.templateKey, columns: card.columns, record: card.record };
+  closeForeignKeyCard();
+  foreignKeyCardEditorOpen.value = true;
+}
+
+function navigateFromForeignKeyCard() {
+  const card = foreignKeyCard.value;
+  if (!card) return;
+  closeForeignKeyCard();
+  void navigateToForeignKeyCell(card.rowIndex, card.col);
+}
+
+function saveForeignKeyCardTemplate(html: string) {
+  const editor = foreignKeyCardEditor.value;
+  if (editor) settingsStore.updateForeignKeyCardTemplate(editor.templateKey, { html });
+}
+
+function resetForeignKeyCardTemplate() {
+  const editor = foreignKeyCardEditor.value;
+  if (editor) settingsStore.updateForeignKeyCardTemplate(editor.templateKey, undefined);
+}
+
+const foreignKeyCardHoverTarget = computed(() => {
+  if (!foreignKeyCardHoverMode.value) return null;
+  const cell = canvasDetailButtonCell.value;
+  return cell?.foreignKey ? `${cell.rowIndex}:${cell.actualColIdx}` : null;
+});
+
+watch(foreignKeyCardHoverTarget, (target) => {
+  clearTimeout(foreignKeyCardHoverTimer);
+  const cell = canvasDetailButtonCell.value;
+  if (!target || !cell) {
+    scheduleForeignKeyCardClose();
+    return;
+  }
+  if (foreignKeyCardOpenFor(cell.rowIndex, cell.actualColIdx)) {
+    clearTimeout(foreignKeyCardCloseTimer);
+    return;
+  }
+  if (foreignKeyCard.value?.pinned) return;
+  foreignKeyCardHoverTimer = setTimeout(() => {
+    const current = canvasDetailButtonCell.value;
+    const button = foreignKeyCardButtonRef.value;
+    if (!current || !button || foreignKeyCardHoverTarget.value !== target) return;
+    void openForeignKeyCard(current.rowIndex, current.actualColIdx, foreignKeyCardAnchorFromElement(button), false);
+  }, 350);
+});
+
+watch(isScrolling, (scrolling) => {
+  if (scrolling) closeForeignKeyCard();
+});
+
+watch(
+  () => props.result,
+  () => closeForeignKeyCard(),
+);
 
 function contextForeignKeyMenuItem(): ContextMenuItem | null {
   const cell = contextCell.value;
@@ -15474,6 +15691,18 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                           <ArrowUpRight class="h-3 w-3" />
                         </button>
                         <button
+                          v-if="canvasDetailButtonCell.foreignKey"
+                          ref="foreignKeyCardButtonRef"
+                          class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
+                          :class="foreignKeyCardOpenFor(canvasDetailButtonCell.rowIndex, canvasDetailButtonCell.actualColIdx) ? 'text-primary ring-primary/60' : ''"
+                          :title="t('grid.foreignKeyCardShow', { table: canvasDetailButtonCell.foreignKey.ref_table })"
+                          data-foreign-key-card-toggle
+                          @mousedown.stop
+                          @click.stop="toggleForeignKeyCard(canvasDetailButtonCell.rowIndex, canvasDetailButtonCell.actualColIdx, $event)"
+                        >
+                          <IdCard class="h-3 w-3" />
+                        </button>
+                        <button
                           v-if="cellDetailButtonEnabled"
                           class="flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
                           :title="t('grid.cellDetails')"
@@ -16242,6 +16471,31 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
       :copy-column-detail-column-name="copyColumnDetailColumnName"
     />
 
+    <DataGridForeignKeyCard
+      v-if="foreignKeyCard"
+      :anchor="foreignKeyCard.anchor"
+      :table="foreignKeyCard.table"
+      :loading="foreignKeyCard.loading"
+      :error="foreignKeyCard.error"
+      :empty="!foreignKeyCard.loading && !foreignKeyCard.error && !foreignKeyCard.record"
+      :html="foreignKeyCardHtml"
+      :dismiss-on-outside-click="foreignKeyCard.pinned"
+      @close="closeForeignKeyCard"
+      @edit="editForeignKeyCardTemplate"
+      @navigate="navigateFromForeignKeyCard"
+      @pointerenter="onForeignKeyCardPointerEnter"
+      @pointerleave="onForeignKeyCardPointerLeave"
+    />
+    <DataGridForeignKeyCardEditorDialog
+      v-if="foreignKeyCardEditor"
+      v-model:open="foreignKeyCardEditorOpen"
+      :table="foreignKeyCardEditor.table"
+      :columns="foreignKeyCardEditor.columns"
+      :saved-html="settingsStore.editorSettings.foreignKeyCardTemplates[foreignKeyCardEditor.templateKey]?.html"
+      :preview-record="foreignKeyCardEditor.record"
+      @save="saveForeignKeyCardTemplate"
+      @reset="resetForeignKeyCardTemplate"
+    />
     <DataGridBulkEditDialog
       v-if="bulkEditDialogMounted"
       v-model:open="bulkEditDialogOpen"
