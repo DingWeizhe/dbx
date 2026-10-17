@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Loader2, RotateCcw, Sparkles } from "@lucide/vue";
+import { LayoutTemplate, Loader2, Sparkles } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import ForeignKeyCardContent from "./ForeignKeyCardContent.vue";
@@ -10,7 +10,8 @@ import { isAiConfigModelCandidate } from "@/lib/ai/aiConfigCandidates";
 import { runtimeEffortFromPreference } from "@/lib/ai/aiEffortPreference";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
-import { buildForeignKeyCardAiRequest, defaultForeignKeyCardHtml, extractForeignKeyCardHtmlFromAi, FOREIGN_KEY_CARD_TEMPLATE_MAX_LENGTH, renderForeignKeyCardHtml } from "@/lib/dataGrid/foreignKeyCard";
+import { buildForeignKeyCardAiRequest, exampleForeignKeyCardHtml, extractForeignKeyCardHtmlFromAi, FOREIGN_KEY_CARD_TEMPLATE_MAX_LENGTH, fullRecordForeignKeyCardHtml, renderForeignKeyCardHtml } from "@/lib/dataGrid/foreignKeyCard";
+import type { ForeignKeyCardRelation } from "@/lib/dataGrid/foreignKeyCardQuery";
 import { getAiProviderPreset, normalizeAiConfig, useSettingsStore } from "@/stores/settingsStore";
 import type { ColumnInfo } from "@/types/database";
 
@@ -18,7 +19,9 @@ const open = defineModel<boolean>("open", { default: false });
 const props = defineProps<{
   table: string;
   columns: readonly ColumnInfo[];
-  /** 已保存的自定义模板；没有时编辑器以默认卡片为起点。 */
+  /** 被引用表自己的外键关联，可用 `{{fk.column}}` 插入。 */
+  relations?: readonly ForeignKeyCardRelation[];
+  /** 已保存的自定义模板；没有时草稿为空，即以表格显示全部列。 */
   savedHtml?: string;
   previewRecord?: Readonly<Record<string, CellValue | undefined>>;
 }>();
@@ -33,15 +36,16 @@ const aiError = ref("");
 const editorRef = ref<HTMLTextAreaElement | null>(null);
 
 const PLACEHOLDER_EXAMPLE = "{{column}}";
+const RELATED_PLACEHOLDER_EXAMPLE = "{{fk_column.column}}";
 const columnNames = computed(() => props.columns.map((column) => column.name));
-const previewHtml = computed(() => renderForeignKeyCardHtml(draft.value, props.previewRecord ?? {}));
+const previewHtml = computed(() => renderForeignKeyCardHtml(draft.value.trim() ? draft.value : fullRecordForeignKeyCardHtml(columnNames.value), props.previewRecord ?? {}));
 const tooLong = computed(() => draft.value.length > FOREIGN_KEY_CARD_TEMPLATE_MAX_LENGTH);
 
 watch(
   open,
   (isOpen) => {
     if (!isOpen) return;
-    draft.value = props.savedHtml?.trim() ? props.savedHtml : defaultForeignKeyCardHtml(columnNames.value);
+    draft.value = props.savedHtml?.trim() ? props.savedHtml : "";
     instruction.value = "";
     aiError.value = "";
   },
@@ -86,8 +90,9 @@ async function generateWithAi() {
     const { systemPrompt, userPrompt } = buildForeignKeyCardAiRequest({
       table: props.table,
       columns: props.columns,
+      relations: props.relations,
       instruction: instruction.value,
-      currentHtml: props.savedHtml?.trim() ? draft.value : undefined,
+      currentHtml: draft.value.trim() ? draft.value : undefined,
       language: String(locale.value),
     });
     const answer = await api.aiComplete({ config, systemPrompt, messages: [{ role: "user", content: userPrompt }], maxTokens: 4096 });
@@ -104,13 +109,15 @@ async function generateWithAi() {
   }
 }
 
-function restoreDefault() {
-  draft.value = defaultForeignKeyCardHtml(columnNames.value);
+function insertExample() {
+  draft.value = exampleForeignKeyCardHtml(columnNames.value);
 }
 
 function save() {
   if (tooLong.value) return;
-  emit("save", draft.value);
+  // 清空后保存 = 删除自定义模板，回到表格显示全部列。
+  if (draft.value.trim()) emit("save", draft.value);
+  else emit("reset");
   open.value = false;
 }
 
@@ -149,6 +156,19 @@ function resetTemplate() {
               {{ column.name }}
             </button>
           </div>
+          <div v-for="relation in relations" :key="relation.column" class="flex flex-wrap items-center gap-1">
+            <span class="mr-1 text-[11px] text-muted-foreground">{{ t("grid.foreignKeyCardRelatedColumns", { column: relation.column, table: relation.table }) }}</span>
+            <button
+              v-for="column in relation.columns"
+              :key="column.name"
+              type="button"
+              class="rounded border border-dashed bg-muted/20 px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+              :title="`${relation.table}.${column.name} (${column.data_type})`"
+              @click="insertPlaceholder(`${relation.column}.${column.name}`)"
+            >
+              {{ relation.column }}.{{ column.name }}
+            </button>
+          </div>
           <textarea
             ref="editorRef"
             v-model="draft"
@@ -156,28 +176,29 @@ function resetTemplate() {
             autocomplete="off"
             autocorrect="off"
             spellcheck="false"
+            :placeholder="t('grid.foreignKeyCardEditorPlaceholder')"
             class="h-[380px] w-full min-w-0 resize-none rounded-[6px] border border-input bg-transparent px-2.5 py-1.5 font-mono text-xs leading-5 outline-none focus-visible:border-ring"
           />
-          <p class="text-xs" :class="tooLong ? 'text-destructive' : 'text-muted-foreground'">{{ t("grid.foreignKeyCardEditorHint", { placeholder: PLACEHOLDER_EXAMPLE }) }}</p>
+          <p class="text-xs" :class="tooLong ? 'text-destructive' : 'text-muted-foreground'">{{ t("grid.foreignKeyCardEditorHint", { placeholder: PLACEHOLDER_EXAMPLE, relatedPlaceholder: RELATED_PLACEHOLDER_EXAMPLE }) }}</p>
         </div>
         <div class="flex min-w-0 flex-col gap-2">
           <div class="text-xs font-medium text-muted-foreground">{{ t("grid.foreignKeyCardPreview") }}</div>
-          <div class="rounded-lg border bg-popover p-3 shadow-sm">
+          <div class="max-h-[460px] overflow-auto rounded-lg border bg-popover p-3 shadow-sm">
             <ForeignKeyCardContent :html="previewHtml" />
           </div>
         </div>
       </div>
       <DialogFooter class="sm:justify-between">
         <div class="flex gap-2">
-          <Button variant="ghost" size="sm" @click="restoreDefault">
-            <RotateCcw class="mr-1 h-3.5 w-3.5" />
-            {{ t("grid.foreignKeyCardUseDefault") }}
+          <Button variant="ghost" size="sm" @click="insertExample">
+            <LayoutTemplate class="mr-1 h-3.5 w-3.5" />
+            {{ t("grid.foreignKeyCardInsertExample") }}
           </Button>
           <Button v-if="savedHtml" variant="ghost" size="sm" class="text-destructive" @click="resetTemplate">{{ t("grid.foreignKeyCardDeleteTemplate") }}</Button>
         </div>
         <div class="flex gap-2">
           <Button variant="outline" @click="open = false">{{ t("dangerDialog.cancel") }}</Button>
-          <Button :disabled="tooLong || !draft.trim()" @click="save">{{ t("grid.foreignKeyCardSave") }}</Button>
+          <Button :disabled="tooLong" @click="save">{{ t("grid.foreignKeyCardSave") }}</Button>
         </div>
       </DialogFooter>
     </DialogContent>

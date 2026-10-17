@@ -320,7 +320,8 @@ import {
 } from "@/lib/dataGrid/dataGridContextMenu";
 import { clearAllColumnHighlights, clearColumnHighlight, computeColumnHighlightMatchKeys, hasColumnHighlight, isColumnDuplicateHighlightActive, isColumnNullHighlightActive, setColumnDuplicateHighlight, setColumnNullHighlight, type ColumnHighlightRule } from "@/lib/dataGrid/dataGridColumnHighlight";
 import DataGridForeignKeyCard, { type ForeignKeyCardAnchor } from "@/components/grid/DataGridForeignKeyCard.vue";
-import { defaultForeignKeyCardHtml, foreignKeyCardTemplateKey, renderForeignKeyCardHtml } from "@/lib/dataGrid/foreignKeyCard";
+import { foreignKeyCardTemplateKey, fullRecordForeignKeyCardHtml, renderForeignKeyCardHtml } from "@/lib/dataGrid/foreignKeyCard";
+import { foreignKeyCardPreviewPaths, foreignKeyCardTemplatePaths, loadForeignKeyCardRecord, loadForeignKeyCardRelations, type ForeignKeyCardQueryDeps, type ForeignKeyCardRelation, type ForeignKeyCardTableRef } from "@/lib/dataGrid/foreignKeyCardQuery";
 import { buildColumnForeignKeyMap, combineForeignKeyConditions, foreignKeyAssociationCells, foreignKeyNavigationTarget, foreignKeySourceColumnName, type ForeignKeyAssociation } from "@/lib/dataGrid/dataGridForeignKeyNavigation";
 import {
   collectForeignKeyDisplayValues,
@@ -13092,7 +13093,10 @@ interface ForeignKeyCardState {
   col: number;
   anchor: ForeignKeyCardAnchor;
   table: string;
+  schema: string;
   templateKey: string;
+  /** 被引用行的 WHERE 条件；编辑器打开时据此重新取完整记录做预览。 */
+  condition?: string;
   loading: boolean;
   error?: string;
   columns: ColumnInfo[];
@@ -13105,6 +13109,7 @@ interface ForeignKeyCardEditorState {
   table: string;
   templateKey: string;
   columns: ColumnInfo[];
+  relations: ForeignKeyCardRelation[];
   record?: Record<string, CellValue>;
 }
 
@@ -13113,8 +13118,10 @@ const foreignKeyCardEditor = ref<ForeignKeyCardEditorState | null>(null);
 const foreignKeyCardEditorOpen = ref(false);
 const foreignKeyCardButtonRef = ref<HTMLButtonElement | null>(null);
 const foreignKeyCardColumnsCache = new Map<string, Promise<ColumnInfo[]>>();
+const foreignKeyCardForeignKeysCache = new Map<string, Promise<ForeignKeyInfo[]>>();
 const foreignKeyCardHoverMode = computed(() => settingsStore.editorSettings.foreignKeyCardTrigger === "hover");
 let foreignKeyCardRequestId = 0;
+let foreignKeyCardEditorRequestId = 0;
 let foreignKeyCardHoverTimer: ReturnType<typeof setTimeout> | undefined;
 let foreignKeyCardCloseTimer: ReturnType<typeof setTimeout> | undefined;
 let foreignKeyCardPointerInside = false;
@@ -13122,8 +13129,7 @@ let foreignKeyCardPointerInside = false;
 const foreignKeyCardHtml = computed(() => {
   const card = foreignKeyCard.value;
   if (!card?.record) return "";
-  const saved = settingsStore.editorSettings.foreignKeyCardTemplates[card.templateKey]?.html;
-  return renderForeignKeyCardHtml(saved ?? defaultForeignKeyCardHtml(card.columns.map((column) => column.name)), card.record);
+  return renderForeignKeyCardHtml(foreignKeyCardTemplateHtml(card.templateKey, card.columns), card.record);
 });
 
 function foreignKeyCardAnchorFromElement(element: Element): ForeignKeyCardAnchor {
@@ -13135,16 +13141,60 @@ function foreignKeyCardOpenFor(rowIndex: number, actualColIdx: number): boolean 
   return foreignKeyCard.value?.rowIndex === rowIndex && foreignKeyCard.value.col === actualColIdx;
 }
 
-function foreignKeyCardColumns(schema: string, table: string): Promise<ColumnInfo[]> {
-  const key = JSON.stringify([props.connectionId, props.database || "", props.tableMeta?.catalog || "", schema, table]);
-  let columns = foreignKeyCardColumnsCache.get(key);
-  if (!columns) {
-    columns = api.getColumns(props.connectionId!, props.database || "", schema, table, props.tableMeta?.catalog);
-    foreignKeyCardColumnsCache.set(key, columns);
-    columns.catch(() => foreignKeyCardColumnsCache.delete(key));
-  }
-  return columns;
+/** 没有自定义模板（或模板为空）时以表格列出全部列。 */
+function foreignKeyCardTemplateHtml(templateKey: string, columns: readonly ColumnInfo[]): string {
+  const saved = settingsStore.editorSettings.foreignKeyCardTemplates[templateKey]?.html;
+  return saved?.trim() ? saved : fullRecordForeignKeyCardHtml(columns.map((column) => column.name));
 }
+
+function foreignKeyCardMetadataKey(ref: ForeignKeyCardTableRef): string {
+  return JSON.stringify([props.connectionId, props.database || "", props.tableMeta?.catalog || "", ref.schema, ref.table]);
+}
+
+function cachedForeignKeyCardMetadata<T>(cache: Map<string, Promise<T>>, ref: ForeignKeyCardTableRef, load: () => Promise<T>): Promise<T> {
+  const key = foreignKeyCardMetadataKey(ref);
+  let value = cache.get(key);
+  if (!value) {
+    value = load();
+    cache.set(key, value);
+    value.catch(() => cache.delete(key));
+  }
+  return value;
+}
+
+const foreignKeyCardQueryDeps: ForeignKeyCardQueryDeps = {
+  columns: (ref) => cachedForeignKeyCardMetadata(foreignKeyCardColumnsCache, ref, () => api.getColumns(props.connectionId!, props.database || "", ref.schema, ref.table, props.tableMeta?.catalog)),
+  foreignKeys: (ref) => cachedForeignKeyCardMetadata(foreignKeyCardForeignKeysCache, ref, () => api.listForeignKeys(props.connectionId!, props.database || "", ref.schema, ref.table, props.tableMeta?.catalog)),
+  condition: (_ref, columnName, columnInfo, value) =>
+    buildColumnValueFilterCondition({
+      databaseType: resolvedDatabaseType.value,
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
+      columnName,
+      columnInfo,
+      rawValue: String(value),
+    }),
+  async selectRow(ref, columns, whereInput) {
+    const connectionId = props.connectionId!;
+    const sql = await buildTableSelectSql({
+      databaseType: resolvedDatabaseType.value,
+      driverProfile: connectionStore.getConfig(connectionId)?.driver_profile,
+      serverVersion: connectionStore.getConfig(connectionId)?.database_info?.productVersion,
+      identifierQuote: connectionStore.connectionIdentifierQuote?.(connectionId),
+      catalog: props.tableMeta?.catalog,
+      database: props.database,
+      schema: ref.schema,
+      tableName: ref.table,
+      columns,
+      projectColumns: !!columns?.length,
+      includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+      whereInput,
+      limit: 1,
+    });
+    const result = await api.executeQuery(connectionId, props.executionDatabase ?? props.database ?? "", sql, ref.schema, undefined, { maxRows: 1, fetchSize: 1, pageSize: 1 });
+    const row = result.rows[0];
+    return row ? Object.fromEntries(result.columns.map((column, index) => [column, (row[index] ?? null) as CellValue])) : undefined;
+  },
+};
 
 async function openForeignKeyCard(rowIndex: number, actualColIdx: number, anchor: ForeignKeyCardAnchor, pinned: boolean) {
   const association = cellForeignKeyAssociation(actualColIdx);
@@ -13152,12 +13202,14 @@ async function openForeignKeyCard(rowIndex: number, actualColIdx: number, anchor
   clearTimeout(foreignKeyCardCloseTimer);
   const fk = association.foreignKey;
   const schema = fk.ref_schema || props.tableMeta?.schema || props.schema || (isSchemaAware(resolvedDatabaseType.value) ? "" : props.database) || "";
+  const ref = { schema, table: fk.ref_table };
   const requestId = ++foreignKeyCardRequestId;
   foreignKeyCard.value = {
     rowIndex,
     col: actualColIdx,
     anchor,
     table: fk.ref_table,
+    schema,
     templateKey: foreignKeyCardTemplateKey({ connectionId: props.connectionId, database: props.database, catalog: props.tableMeta?.catalog, schema, table: fk.ref_table }),
     loading: true,
     columns: [],
@@ -13165,29 +13217,13 @@ async function openForeignKeyCard(rowIndex: number, actualColIdx: number, anchor
   };
   try {
     const target = await foreignKeyCellCondition(rowIndex, actualColIdx);
-    const columns = await foreignKeyCardColumns(schema, fk.ref_table);
-    let record: Record<string, CellValue> | undefined;
-    if (target) {
-      // 取整行：自定义模板可引用任意列，编辑器预览也需要完整记录。
-      const sql = await buildTableSelectSql({
-        databaseType: resolvedDatabaseType.value,
-        driverProfile: connectionStore.getConfig(props.connectionId)?.driver_profile,
-        serverVersion: connectionStore.getConfig(props.connectionId)?.database_info?.productVersion,
-        identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
-        catalog: props.tableMeta?.catalog,
-        database: props.database,
-        schema,
-        tableName: fk.ref_table,
-        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
-        whereInput: target.condition,
-        limit: 1,
-      });
-      const result = await api.executeQuery(props.connectionId, props.executionDatabase ?? props.database ?? "", sql, schema, undefined, { maxRows: 1, fetchSize: 1, pageSize: 1 });
-      const row = result.rows[0];
-      if (row) record = Object.fromEntries(result.columns.map((column, index) => [column, (row[index] ?? null) as CellValue]));
-    }
+    const columns = await foreignKeyCardQueryDeps.columns(ref);
+    const templateKey = foreignKeyCard.value?.templateKey ?? "";
+    const savedHtml = settingsStore.editorSettings.foreignKeyCardTemplates[templateKey]?.html;
+    // 自定义模板只查用到的列（含 `fk.column` 关联）；空模板显示全部列，直接查整行。
+    const record = target ? await loadForeignKeyCardRecord(ref, target.condition, savedHtml?.trim() ? foreignKeyCardTemplatePaths(savedHtml) : undefined, foreignKeyCardQueryDeps) : undefined;
     if (requestId !== foreignKeyCardRequestId || !foreignKeyCard.value) return;
-    foreignKeyCard.value = { ...foreignKeyCard.value, loading: false, columns, record };
+    foreignKeyCard.value = { ...foreignKeyCard.value, loading: false, columns, record, condition: target?.condition };
   } catch (e: any) {
     if (requestId !== foreignKeyCardRequestId || !foreignKeyCard.value) return;
     foreignKeyCard.value = { ...foreignKeyCard.value, loading: false, error: String(e?.message || e) };
@@ -13231,12 +13267,25 @@ function onForeignKeyCardPointerLeave() {
   scheduleForeignKeyCardClose();
 }
 
-function editForeignKeyCardTemplate() {
+async function editForeignKeyCardTemplate() {
   const card = foreignKeyCard.value;
   if (!card || card.loading) return;
-  foreignKeyCardEditor.value = { table: card.table, templateKey: card.templateKey, columns: card.columns, record: card.record };
+  const requestId = ++foreignKeyCardEditorRequestId;
+  foreignKeyCardEditor.value = { table: card.table, templateKey: card.templateKey, columns: card.columns, relations: [], record: card.record };
   closeForeignKeyCard();
   foreignKeyCardEditorOpen.value = true;
+  // 卡片只取了模板用到的列；编辑器预览需要全部列和一层关联，打开后在后台补齐。
+  const ref = { schema: card.schema, table: card.table };
+  try {
+    const relations = await loadForeignKeyCardRelations(ref, foreignKeyCardQueryDeps);
+    if (requestId !== foreignKeyCardEditorRequestId || !foreignKeyCardEditor.value) return;
+    foreignKeyCardEditor.value = { ...foreignKeyCardEditor.value, relations };
+    const record = card.condition ? await loadForeignKeyCardRecord(ref, card.condition, foreignKeyCardPreviewPaths(card.columns, relations), foreignKeyCardQueryDeps) : card.record;
+    if (requestId !== foreignKeyCardEditorRequestId || !foreignKeyCardEditor.value) return;
+    foreignKeyCardEditor.value = { ...foreignKeyCardEditor.value, record };
+  } catch (e: any) {
+    appendDebugLog("warn", "[DBX][DataGrid:foreign-key-card:editor-preview]", { table: card.table, message: String(e?.message || e) });
+  }
 }
 
 function navigateFromForeignKeyCard() {
@@ -16491,6 +16540,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
       v-model:open="foreignKeyCardEditorOpen"
       :table="foreignKeyCardEditor.table"
       :columns="foreignKeyCardEditor.columns"
+      :relations="foreignKeyCardEditor.relations"
       :saved-html="settingsStore.editorSettings.foreignKeyCardTemplates[foreignKeyCardEditor.templateKey]?.html"
       :preview-record="foreignKeyCardEditor.record"
       @save="saveForeignKeyCardTemplate"

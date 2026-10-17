@@ -2,11 +2,12 @@
 
 import { describe, expect, it } from "vitest";
 import {
-  defaultForeignKeyCardHtml,
+  exampleForeignKeyCardHtml,
   extractForeignKeyCardHtmlFromAi,
   fillForeignKeyCardTemplate,
   foreignKeyCardTemplateColumns,
   foreignKeyCardTemplateKey,
+  fullRecordForeignKeyCardHtml,
   normalizeForeignKeyCardTemplates,
   normalizeForeignKeyCardTrigger,
   renderForeignKeyCardHtml,
@@ -41,12 +42,23 @@ describe("foreign key card templates", () => {
     expect(html).toContain('src="data:image/png;base64,AAAA"');
   });
 
-  it("builds a default card with avatar and title detection", () => {
-    const html = defaultForeignKeyCardHtml(["id", "avatar_url", "name", "gender"]);
+  it("shows every column as a table when there is no template", () => {
+    const html = renderForeignKeyCardHtml(fullRecordForeignKeyCardHtml(["id", "name", "a<b"]), { id: 1, name: "Ann", "a<b": null });
+    expect(html).toContain("<th>id</th><td>1</td>");
+    expect(html).toContain("<th>name</th><td>Ann</td>");
+    expect(html).toContain("<th>a&lt;b</th><td></td>");
+  });
+
+  it("builds an example card with avatar and title detection", () => {
+    const html = exampleForeignKeyCardHtml(["id", "avatar_url", "name", "gender"]);
     expect(html).toContain('src="{{avatar_url}}"');
     expect(html).toContain('<div class="title">{{name}}</div>');
     expect(html).toContain("<dt>gender</dt><dd>{{gender}}</dd>");
     expect(renderForeignKeyCardHtml(html, { id: 1, avatar_url: "a.png", name: "Ann", gender: "F" })).toContain("Ann");
+  });
+
+  it("fills dotted placeholders for related columns", () => {
+    expect(fillForeignKeyCardTemplate("{{dept_id.Name}}", { "dept_id.name": "R&D" })).toBe("R&amp;D");
   });
 
   it("keys templates by referenced table", () => {
